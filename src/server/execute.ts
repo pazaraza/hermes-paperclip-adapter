@@ -36,7 +36,6 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
-  VALID_PROVIDERS,
 } from "../shared/constants.js";
 
 import {
@@ -108,7 +107,7 @@ Address the comment, POST a reply if needed, then continue working.
 ## Heartbeat Wake — Check for Work
 
 1. List ALL open issues assigned to you (todo, backlog, in_progress):
-   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c 'import sys,json; [print(i["identifier"], i["status"], i["priority"], i["title"]) for i in json.load(sys.stdin) if i["status"] not in ("done","cancelled")]'\`
 
 2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
    - Read the issue details: \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
@@ -116,7 +115,7 @@ Address the comment, POST a reply if needed, then continue working.
    - When done, mark complete and post a comment (see Workflow steps 2-4 above)
 
 3. If no issues assigned to you, check for unassigned issues:
-   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c 'import sys,json; [print(i["identifier"], i["title"]) for i in json.load(sys.stdin) if not i.get("assigneeAgentId")]'\`
    If you find a relevant issue, assign it to yourself:
    \`curl -s -X PATCH -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
 
@@ -143,9 +142,11 @@ function buildPrompt(
     cfgString(config.paperclipApiUrl) ||
     process.env.PAPERCLIP_API_URL ||
     "http://127.0.0.1:3100/api";
-  // Ensure /api suffix
+  // Ensure /api suffix (strip trailing slashes first so "http://host/api/"
+  // doesn't become "http://host/api/api")
+  paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "");
   if (!paperclipApiUrl.endsWith("/api")) {
-    paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
+    paperclipApiUrl += "/api";
   }
 
   const vars: Record<string, unknown> = {
@@ -193,7 +194,7 @@ function buildPrompt(
 // ---------------------------------------------------------------------------
 
 /** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
-const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
+const SESSION_ID_REGEX = /^session_id:\s*(\S+)/gm;
 
 /** Regex for legacy session output format */
 const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
@@ -254,19 +255,19 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   <response text>
   //
   //   session_id: <id>
-  const sessionMatch = stdout.match(SESSION_ID_REGEX);
-  if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
+  // Hermes prints session_id last, so take the LAST match — the response
+  // body itself may contain a line starting with "session_id:".
+  const sessionMatches = [...stdout.matchAll(SESSION_ID_REGEX)];
+  const sessionMatch = sessionMatches[sessionMatches.length - 1];
+  if (sessionMatch?.[1] && sessionMatch.index !== undefined) {
+    result.sessionId = sessionMatch[1];
     // The response is everything before the session_id line
-    const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
-    if (sessionLineIdx > 0) {
-      result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
-    }
+    result.response = cleanResponse(stdout.slice(0, sessionMatch.index));
   } else {
     // Legacy format (non-quiet mode)
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
     if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
+      result.sessionId = legacyMatch[1];
     }
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
@@ -389,12 +390,16 @@ export async function execute(
   // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
   args.push("--source", "tool");
 
-  // Bypass Hermes dangerous-command approval prompts.
+  // Bypass Hermes dangerous-command approval prompts (default: on).
   // Paperclip agents run as non-interactive subprocesses with no TTY,
   // so approval prompts would always timeout and deny legitimate commands
   // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
   // system is designed for human-attended interactive sessions.
-  args.push("--yolo");
+  // Set adapterConfig.approvalBypass = false to keep approvals enabled
+  // (dangerous commands will then be denied rather than prompted).
+  if (cfgBoolean(config.approvalBypass) !== false) {
+    args.push("--yolo");
+  }
 
   // Session resume
   const prevSessionId = cfgString(
@@ -415,8 +420,8 @@ export async function execute(
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
-  if ((ctx as any).authToken && !env.PAPERCLIP_API_KEY)
-    env.PAPERCLIP_API_KEY = (ctx as any).authToken;
+  if (ctx.authToken && !env.PAPERCLIP_API_KEY)
+    env.PAPERCLIP_API_KEY = ctx.authToken;
   const taskId = cfgString(ctx.config?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
@@ -450,24 +455,41 @@ export async function execute(
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
   // Paperclip renders all stderr as red/error in the UI.
   // Wrap onLog to reclassify benign stderr lines as stdout.
+  // Benign patterns that should NOT appear as errors:
+  // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
+  // - MCP server registration messages
+  // - Python import/site noise
+  const isBenignStderrLine = (line: string): boolean =>
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(line) || // structured timestamps
+    /^(INFO|DEBUG|WARN|WARNING)\b[:\s]/.test(line) || // log levels
+    /Successfully registered all tools/.test(line) ||
+    /MCP [Ss]erver/.test(line) ||
+    /tool registered successfully/.test(line) ||
+    /Application initialized/.test(line);
+
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
-    if (stream === "stderr") {
-      const trimmed = chunk.trimEnd();
-      // Benign patterns that should NOT appear as errors:
-      // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
-      // - MCP server registration messages
-      // - Python import/site noise
-      const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
-        /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
-        /Successfully registered all tools/.test(trimmed) ||
-        /MCP [Ss]erver/.test(trimmed) ||
-        /tool registered successfully/.test(trimmed) ||
-        /Application initialized/.test(trimmed);
-      if (isBenign) {
-        return ctx.onLog("stdout", chunk);
-      }
+    if (stream !== "stderr") {
+      return ctx.onLog(stream, chunk);
     }
-    return ctx.onLog(stream, chunk);
+    // A chunk may contain several lines — classify each line, then emit
+    // contiguous runs so a real error bundled after benign INFO lines
+    // still shows up as stderr.
+    const lines = chunk.split(/(?<=\n)/);
+    let buffered = "";
+    let bufferedStream: "stdout" | "stderr" | null = null;
+    for (const line of lines) {
+      const target: "stdout" | "stderr" =
+        !line.trim() || isBenignStderrLine(line.trim()) ? "stdout" : "stderr";
+      if (bufferedStream !== null && target !== bufferedStream) {
+        await ctx.onLog(bufferedStream, buffered);
+        buffered = "";
+      }
+      buffered += line;
+      bufferedStream = target;
+    }
+    if (bufferedStream !== null && buffered) {
+      await ctx.onLog(bufferedStream, buffered);
+    }
   };
 
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {

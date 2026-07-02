@@ -49,6 +49,9 @@ export const VALID_PROVIDERS = [
  * Longer prefixes are matched first (order matters).
  */
 export const MODEL_PREFIX_PROVIDER_HINTS: [string, string][] = [
+  // HuggingFace models (org/model format) — full-string prefix, must be
+  // checked before bare-name hints like "llama"/"qwen" match the model name
+  ["huggingface/", "huggingface"],
   // OpenAI-native models
   ["gpt-4", "openai-codex"],
   ["gpt-5", "copilot"],
@@ -76,8 +79,6 @@ export const MODEL_PREFIX_PROVIDER_HINTS: [string, string][] = [
   ["qwen", "auto"],
   // Mistral
   ["mistral", "auto"],
-  // HuggingFace models (org/model format)
-  ["huggingface/", "huggingface"],
 ];
 
 /** Regex to extract session ID from Hermes CLI output. */

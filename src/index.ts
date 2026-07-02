@@ -43,7 +43,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 |-------|------|---------|-------------|
 | model | string | (Hermes configured default) | Optional explicit model in provider/model format. Leave blank to use Hermes's configured default model. |
 | provider | string | (auto) | API provider: auto, openrouter, nous, openai-codex, zai, kimi-coding, minimax, minimax-cn. Usually not needed — Hermes auto-detects from model name. |
-| timeoutSec | number | 300 | Execution timeout in seconds |
+| timeoutSec | number | 1800 | Execution timeout in seconds |
 | graceSec | number | 10 | Grace period after SIGTERM before SIGKILL |
 
 ## Tool Configuration
@@ -65,6 +65,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | hermesCommand | string | hermes | Path to hermes CLI binary |
+| approvalBypass | boolean | true | Pass --yolo to skip dangerous-command approval prompts (required for non-interactive runs; set false to keep approvals, which denies dangerous commands) |
 | verbose | boolean | false | Enable verbose output |
 | extraArgs | string[] | [] | Additional CLI arguments |
 | env | object | {} | Extra environment variables |

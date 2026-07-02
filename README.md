@@ -108,7 +108,7 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 |-------|------|---------|-------------|
 | `model` | string | `anthropic/claude-sonnet-4` | Model in `provider/model` format |
 | `provider` | string | *(auto-detected)* | API provider: `auto`, `openrouter`, `nous`, `openai-codex`, `zai`, `kimi-coding`, `minimax`, `minimax-cn` |
-| `timeoutSec` | number | `300` | Execution timeout in seconds |
+| `timeoutSec` | number | `1800` | Execution timeout in seconds |
 | `graceSec` | number | `10` | Grace period before SIGKILL |
 
 ### Tools
@@ -132,6 +132,7 @@ Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vis
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `hermesCommand` | string | `hermes` | Custom CLI binary path |
+| `approvalBypass` | boolean | `true` | Pass `--yolo` to skip dangerous-command approval prompts (required for non-interactive runs; set `false` to keep approvals, which denies dangerous commands) |
 | `verbose` | boolean | `false` | Enable verbose output |
 | `quiet` | boolean | `true` | Quiet mode (clean output, no banner/spinner) |
 | `extraArgs` | string[] | `[]` | Additional CLI arguments |
