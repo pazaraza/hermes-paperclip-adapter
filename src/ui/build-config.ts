@@ -43,7 +43,12 @@ export function buildHermesConfig(
   // Execution limits — let the user configure these from the Paperclip UI.
   // timeoutSec: wall-clock kill timeout for the hermes child process.
   // maxTurnsPerRun: maps to Hermes's --max-turns (agent tool-calling iterations).
-  ac.timeoutSec = DEFAULT_TIMEOUT_SEC;
+  //
+  // Only persist timeoutSec when we actually derive it from maxTurnsPerRun.
+  // Baking DEFAULT_TIMEOUT_SEC into every stored config freezes the default at
+  // config-creation time, so a later bump to DEFAULT_TIMEOUT_SEC wouldn't apply
+  // to existing agents. When unset, execute.ts falls back to DEFAULT_TIMEOUT_SEC
+  // at runtime.
   if (v.maxTurnsPerRun > 0) {
     ac.maxTurnsPerRun = v.maxTurnsPerRun;
     // Scale timeout to match: ~20s per tool turn is generous headroom.
@@ -64,7 +69,12 @@ export function buildHermesConfig(
     ac.hermesCommand = v.command;
   }
 
-  // Extra CLI arguments
+  // Extra CLI arguments.
+  // LIMITATION: this splits on whitespace only — it does NOT honor shell
+  // quoting. An argument like --foo "a b" becomes ["--foo", "\"a", "b\""]
+  // rather than ["--foo", "a b"]. Users needing quoted/spaced argument values
+  // should pass them via a different config field or a wrapper script. A proper
+  // shell-splitter (respecting quotes/escapes) would be needed to fix this.
   if (v.extraArgs) {
     ac.extraArgs = v.extraArgs.split(/\s+/).filter(Boolean);
   }

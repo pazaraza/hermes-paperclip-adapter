@@ -196,15 +196,38 @@ function buildPrompt(
 /** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
 const SESSION_ID_REGEX = /^session_id:\s*(\S+)/gm;
 
-/** Regex for legacy session output format */
-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
+/**
+ * Regex for legacy session output format. Anchored to a whole line so we only
+ * trust "session_id: <id>" style status lines, not incidental prose in the
+ * agent's response. Global + multiline so we can pick the LAST match near the
+ * end of the output.
+ */
+const SESSION_ID_REGEX_LEGACY =
+  /^\s*session[_ ](?:id|saved)[:\s]+([A-Za-z0-9][A-Za-z0-9_-]{4,})\s*$/gim;
 
-/** Regex to extract token usage from Hermes output. */
+/**
+ * Regex to extract token usage from Hermes stats output. Anchored to the start
+ * of a line (multiline) so agent prose like "used 20 input words" further into
+ * a sentence can't be misread as usage stats.
+ */
 const TOKEN_USAGE_REGEX =
-  /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
+  /^\s*tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/im;
 
-/** Regex to extract cost from Hermes output. */
-const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+/**
+ * Regex to extract cost from Hermes stats output. Anchored to the start of a
+ * line (multiline) so prose like "The total cost: $499" mid-sentence is not
+ * mistaken for the run's cost.
+ */
+const COST_REGEX = /^\s*(?:cost|spent)[:\s]*\$?([\d.]+)/im;
+
+/**
+ * Validate a captured session id's shape before we trust it for resume/persist.
+ * Session ids are opaque tokens (often UUID-like) — reject obvious junk so a
+ * loose match on noisy output can't poison the next run's --resume.
+ */
+function isValidSessionId(id: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{4,127}$/.test(id);
+}
 
 interface ParsedOutput {
   sessionId?: string;
@@ -212,6 +235,108 @@ interface ParsedOutput {
   usage?: UsageSummary;
   costUsd?: number;
   errorMessage?: string;
+}
+
+/**
+ * Classify a stderr line as benign (should be shown as stdout) or a real error.
+ *
+ * Benign patterns that should NOT appear as errors:
+ * - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...  (level-aware — a
+ *   timestamped ERROR line is NOT benign)
+ * - MCP server registration messages
+ * - Python import/site noise
+ */
+export function isBenignStderrLine(line: string): boolean {
+  // An explicit error/critical level is NEVER benign — even if the same line
+  // also mentions "MCP server", tools, etc. This guards the substring rules
+  // below (e.g. a line like "[ts] ERROR: MCP server crashed" must stay stderr).
+  if (
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}T[^\]]*\]?\s*(ERROR|CRITICAL|FATAL)\b/i.test(line) ||
+    /^(ERROR|CRITICAL|FATAL)\b[:\s]/i.test(line)
+  ) {
+    return false;
+  }
+  return (
+    // Timestamped structured logs — benign ONLY when the level after the
+    // timestamp is INFO/DEBUG/WARN. A timestamped ERROR line falls through.
+    /^\[?\d{4}[-/]\d{2}[-/]\d{2}T[^\]]*\]?\s*(INFO|DEBUG|WARN(ING)?)\b/.test(line) ||
+    /^(INFO|DEBUG|WARN|WARNING)\b[:\s]/.test(line) || // bare log levels
+    /Successfully registered all tools/.test(line) ||
+    /MCP [Ss]erver/.test(line) ||
+    /tool registered successfully/.test(line) ||
+    /Application initialized/.test(line)
+  );
+}
+
+/**
+ * Match a leading log-level token (optionally after a bracketed timestamp).
+ * Used to exclude benign log lines from stderr error extraction WITHOUT
+ * dropping real error lines that merely contain "info"/"warn"/"debug" as a
+ * substring somewhere in the message.
+ */
+const LEADING_LOG_LEVEL_REGEX =
+  /^\s*(?:\[[^\]]*\]\s*)?(?:INFO|DEBUG|WARN(?:ING)?|TRACE)\b/i;
+
+/**
+ * Reclassify streamed stderr chunks line-by-line, emitting benign lines as
+ * stdout and real errors as stderr. Contiguous runs of the same target are
+ * coalesced into a single emit so ordering is preserved.
+ *
+ * A carry buffer holds the last unterminated line fragment across chunk
+ * boundaries: without it, a line split mid-way between two chunks would be
+ * classified twice from partial views and could land on the wrong stream.
+ * Callers MUST `flush()` after the stream closes to emit any final fragment.
+ */
+export function makeStderrReclassifier(
+  emit: (stream: "stdout" | "stderr", text: string) => void | Promise<void>,
+  isBenign: (line: string) => boolean = isBenignStderrLine,
+) {
+  let carry = "";
+
+  const emitLines = async (text: string): Promise<void> => {
+    // Split keeping the trailing newline on each line.
+    const lines = text.split(/(?<=\n)/);
+    let buffered = "";
+    let bufferedStream: "stdout" | "stderr" | null = null;
+    for (const line of lines) {
+      if (line === "") continue;
+      const target: "stdout" | "stderr" =
+        !line.trim() || isBenign(line.trim()) ? "stdout" : "stderr";
+      if (bufferedStream !== null && target !== bufferedStream) {
+        await emit(bufferedStream, buffered);
+        buffered = "";
+      }
+      buffered += line;
+      bufferedStream = target;
+    }
+    if (bufferedStream !== null && buffered) {
+      await emit(bufferedStream, buffered);
+    }
+  };
+
+  return {
+    /** Feed a raw stderr chunk. Complete lines are emitted; the trailing
+     * unterminated fragment (if any) is held until the next push/flush. */
+    async push(chunk: string): Promise<void> {
+      const data = carry + chunk;
+      const lastNl = data.lastIndexOf("\n");
+      if (lastNl === -1) {
+        // No complete line yet — hold everything.
+        carry = data;
+        return;
+      }
+      carry = data.slice(lastNl + 1);
+      await emitLines(data.slice(0, lastNl + 1));
+    },
+    /** Emit any remaining buffered fragment. Call once the stream closes. */
+    async flush(): Promise<void> {
+      if (carry) {
+        const remaining = carry;
+        carry = "";
+        await emitLines(remaining);
+      }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -247,8 +372,11 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
-  const combined = stdout + "\n" + stderr;
+export function parseHermesOutput(
+  stdout: string,
+  stderr: string,
+  opts: { exitCode?: number | null; timedOut?: boolean } = {},
+): ParsedOutput {
   const result: ParsedOutput = {};
 
   // In quiet mode, Hermes outputs:
@@ -259,15 +387,29 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   // body itself may contain a line starting with "session_id:".
   const sessionMatches = [...stdout.matchAll(SESSION_ID_REGEX)];
   const sessionMatch = sessionMatches[sessionMatches.length - 1];
-  if (sessionMatch?.[1] && sessionMatch.index !== undefined) {
+
+  // Region used for usage/cost extraction: only the tail after the last
+  // session_id line (Hermes prints stats there), plus stderr. This keeps the
+  // agent's own response prose ("The total cost: $499") out of the search.
+  let statsRegion = stderr;
+
+  if (
+    sessionMatch?.[1] &&
+    sessionMatch.index !== undefined &&
+    isValidSessionId(sessionMatch[1])
+  ) {
     result.sessionId = sessionMatch[1];
     // The response is everything before the session_id line
     result.response = cleanResponse(stdout.slice(0, sessionMatch.index));
+    statsRegion = stdout.slice(sessionMatch.index) + "\n" + stderr;
   } else {
-    // Legacy format (non-quiet mode)
-    const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch[1];
+    // Legacy format (non-quiet mode): trust only line-anchored matches near
+    // the end of output, and validate the captured id's shape.
+    const tail = stdout.split("\n").slice(-15).join("\n");
+    const legacyMatches = [...tail.matchAll(SESSION_ID_REGEX_LEGACY)];
+    const legacyId = legacyMatches[legacyMatches.length - 1]?.[1];
+    if (legacyId && isValidSessionId(legacyId)) {
+      result.sessionId = legacyId;
     }
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
@@ -277,8 +419,8 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     }
   }
 
-  // Extract token usage
-  const usageMatch = combined.match(TOKEN_USAGE_REGEX);
+  // Extract token usage (from the stats region only, line-anchored)
+  const usageMatch = statsRegion.match(TOKEN_USAGE_REGEX);
   if (usageMatch) {
     result.usage = {
       inputTokens: parseInt(usageMatch[1], 10) || 0,
@@ -286,20 +428,36 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     };
   }
 
-  // Extract cost
-  const costMatch = combined.match(COST_REGEX);
+  // Extract cost (from the stats region only, line-anchored)
+  const costMatch = statsRegion.match(COST_REGEX);
   if (costMatch?.[1]) {
     result.costUsd = parseFloat(costMatch[1]);
   }
 
-  // Check for error patterns in stderr
-  if (stderr.trim()) {
-    const errorLines = stderr
-      .split("\n")
+  // Only surface an errorMessage when the run actually failed. A benign stderr
+  // line must not mark a successful (exit 0) run as errored.
+  const failed =
+    (opts.exitCode !== undefined &&
+      opts.exitCode !== null &&
+      opts.exitCode !== 0) ||
+    opts.timedOut === true;
+
+  if (failed && stderr.trim()) {
+    const stderrLines = stderr.split("\n");
+    // Match error-looking lines, excluding those whose LEADING token is a log
+    // level (so "failed to fetch info" is kept, "INFO: ... failed" is dropped).
+    const errorLines = stderrLines
       .filter((line) => /error|exception|traceback|failed/i.test(line))
-      .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
+      .filter((line) => !LEADING_LOG_LEVEL_REGEX.test(line));
     if (errorLines.length > 0) {
       result.errorMessage = errorLines.slice(0, 5).join("\n");
+    } else {
+      // Fallback: the run failed but nothing matched the error patterns — use
+      // the last ~5 non-empty stderr lines so we don't silently drop context.
+      const nonEmpty = stderrLines.filter((line) => line.trim());
+      if (nonEmpty.length > 0) {
+        result.errorMessage = nonEmpty.slice(-5).join("\n");
+      }
     }
   }
 
@@ -317,7 +475,10 @@ export async function execute(
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
-  const model = cfgString(config.model) || DEFAULT_MODEL;
+  // Explicit model from config. When unset we deliberately DO NOT force a
+  // default — we let Hermes use its own configured default model (which also
+  // preserves provider inference for non-Anthropic setups). See below.
+  const configModel = cfgString(config.model);
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
@@ -340,7 +501,8 @@ export async function execute(
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   const explicitProvider = cfgString(config.provider);
 
-  if (!explicitProvider) {
+  // Detect the Hermes config when we need either the provider or the model.
+  if (!explicitProvider || !configModel) {
     try {
       detectedConfig = await detectModel();
     } catch {
@@ -348,12 +510,22 @@ export async function execute(
     }
   }
 
+  // Model used for provider inference and reporting. Prefer the explicit
+  // config model, then the detected config model. Do NOT fall back to
+  // DEFAULT_MODEL here: inferring a provider from a made-up default would
+  // wrongly force (e.g.) "anthropic" onto a non-Anthropic setup.
+  const modelForResolution = configModel || detectedConfig?.model;
+
   const { provider: resolvedProvider, resolvedFrom } = resolveProvider({
     explicitProvider,
     detectedProvider: detectedConfig?.provider,
     detectedModel: detectedConfig?.model,
-    model,
+    model: modelForResolution,
   });
+
+  // Best-effort label for logging/result metadata only. When nothing is known
+  // we surface DEFAULT_MODEL as a hint, but we still do NOT pass -m below.
+  const reportedModel = configModel || detectedConfig?.model || DEFAULT_MODEL;
 
   // ── Build prompt ───────────────────────────────────────────────────────
   const prompt = buildPrompt(ctx, config);
@@ -364,8 +536,10 @@ export async function execute(
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
-  if (model) {
-    args.push("-m", model);
+  // Only pass -m when the user explicitly configured a model. Otherwise omit
+  // it entirely so Hermes uses its own configured default model.
+  if (configModel) {
+    args.push("-m", configModel);
   }
 
   // Always pass --provider when we have a resolved one (not "auto").
@@ -420,8 +594,10 @@ export async function execute(
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
-  if (ctx.authToken && !env.PAPERCLIP_API_KEY)
-    env.PAPERCLIP_API_KEY = ctx.authToken;
+  // The per-run auth token always wins over any inherited/stale
+  // PAPERCLIP_API_KEY from process.env. Explicit config.env overrides are
+  // applied afterward (below) and still take precedence.
+  if (ctx.authToken) env.PAPERCLIP_API_KEY = ctx.authToken;
   const taskId = cfgString(ctx.config?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
@@ -442,7 +618,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
+    `[hermes] Starting Hermes Agent (model=${configModel ?? `${reportedModel} (hermes default)`}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
@@ -454,42 +630,18 @@ export async function execute(
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
   // Paperclip renders all stderr as red/error in the UI.
-  // Wrap onLog to reclassify benign stderr lines as stdout.
-  // Benign patterns that should NOT appear as errors:
-  // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
-  // - MCP server registration messages
-  // - Python import/site noise
-  const isBenignStderrLine = (line: string): boolean =>
-    /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(line) || // structured timestamps
-    /^(INFO|DEBUG|WARN|WARNING)\b[:\s]/.test(line) || // log levels
-    /Successfully registered all tools/.test(line) ||
-    /MCP [Ss]erver/.test(line) ||
-    /tool registered successfully/.test(line) ||
-    /Application initialized/.test(line);
+  // Wrap onLog to reclassify benign stderr lines as stdout. A per-run carry
+  // buffer holds the last unterminated line fragment so a line split across
+  // two chunks isn't misclassified from a partial view.
+  const reclassifier = makeStderrReclassifier((stream, text) =>
+    ctx.onLog(stream, text),
+  );
 
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
     if (stream !== "stderr") {
       return ctx.onLog(stream, chunk);
     }
-    // A chunk may contain several lines — classify each line, then emit
-    // contiguous runs so a real error bundled after benign INFO lines
-    // still shows up as stderr.
-    const lines = chunk.split(/(?<=\n)/);
-    let buffered = "";
-    let bufferedStream: "stdout" | "stderr" | null = null;
-    for (const line of lines) {
-      const target: "stdout" | "stderr" =
-        !line.trim() || isBenignStderrLine(line.trim()) ? "stdout" : "stderr";
-      if (bufferedStream !== null && target !== bufferedStream) {
-        await ctx.onLog(bufferedStream, buffered);
-        buffered = "";
-      }
-      buffered += line;
-      bufferedStream = target;
-    }
-    if (bufferedStream !== null && buffered) {
-      await ctx.onLog(bufferedStream, buffered);
-    }
+    await reclassifier.push(chunk);
   };
 
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
@@ -500,8 +652,14 @@ export async function execute(
     onLog: wrappedOnLog,
   });
 
+  // Flush any trailing stderr fragment left in the carry buffer.
+  await reclassifier.flush();
+
   // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "", {
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+  });
 
   await ctx.onLog(
     "stdout",
@@ -517,7 +675,7 @@ export async function execute(
     signal: result.signal,
     timedOut: result.timedOut,
     provider: resolvedProvider,
-    model,
+    model: reportedModel,
   };
 
   if (parsed.errorMessage) {

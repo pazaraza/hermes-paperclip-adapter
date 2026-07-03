@@ -104,6 +104,16 @@ export function parseModelFromConfig(content: string): DetectedModel | null {
 export function inferProviderFromModel(model: string): string | undefined {
   const lower = model.toLowerCase();
 
+  // An explicit provider path prefix wins: "openrouter/anthropic/claude-sonnet-4"
+  // is routed via openrouter, not anthropic. If the FIRST path segment is a
+  // known provider, trust it directly instead of inferring from the model name.
+  if (lower.includes("/")) {
+    const firstSegment = lower.split("/")[0];
+    if ((VALID_PROVIDERS as readonly string[]).includes(firstSegment)) {
+      return firstSegment;
+    }
+  }
+
   // Strip provider/ prefix if present (e.g. "anthropic/claude-sonnet-4")
   const bareName = lower.includes("/") ? lower.split("/").pop()! : lower;
 
