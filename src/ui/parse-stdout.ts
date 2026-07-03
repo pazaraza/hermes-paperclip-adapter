@@ -24,7 +24,10 @@ import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
  */
 function stripKaomoji(text: string): string {
   // Strip parenthesized kaomoji faces: (｡◕‿◕｡), (★ω★), etc.
-  return text.replace(/[(][^()]{2,20}[)]\s*/gu, "").trim();
+  // Require at least one non-ASCII char inside the parens so ordinary
+  // parenthesized text — e.g. print(foo) in a command detail or a (0.5s)
+  // duration — is left intact.
+  return text.replace(/[(](?=[^()]{2,20}[)])[^()]*[^\x00-\x7F][^()]*[)]\s*/gu, "").trim();
 }
 
 // ── Line classification ────────────────────────────────────────────────────
@@ -59,6 +62,9 @@ function parseToolCompletionLine(
   cleaned = cleaned.slice(TOOL_OUTPUT_PREFIX.length);
   cleaned = stripKaomoji(cleaned).trim();
 
+  // Skip the leading tool emoji so the next token is the verb
+  cleaned = cleaned.replace(/^\p{Extended_Pictographic}\uFE0F?\s*/u, "");
+
   // Now format is: "{emoji} {verb:9} {detail}  {duration}" or "{emoji} {verb:9} {detail}  {duration} ({total})"
   // Example: "💻 $         curl -s ..." or "🔍 search    pattern  0.1s"
   // The verb+detail are separated by whitespace, duration is at the end
@@ -73,8 +79,8 @@ function parseToolCompletionLine(
     ? cleaned.slice(0, cleaned.lastIndexOf(durationMatch[0])).trim()
     : cleaned;
 
-  // Check for error suffixes
-  const hasError = /\[(?:exit \d+|error|full)\]/.test(verbAndDetail) ||
+  // Check for error suffixes ([exit 0] is success, not an error)
+  const hasError = /\[(?:exit [1-9]\d*|error|full)\]/.test(verbAndDetail) ||
     /\[error\]\s*$/.test(cleaned);
 
   // The first token (after emoji) is the verb, rest is detail
