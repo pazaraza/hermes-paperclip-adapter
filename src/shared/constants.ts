@@ -81,15 +81,12 @@ export const MODEL_PREFIX_PROVIDER_HINTS: [string, string][] = [
   ["mistral", "auto"],
 ];
 
-/** Regex to extract session ID from Hermes CLI output. */
-export const SESSION_ID_REGEX = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
-
-/** Regex to extract token usage from Hermes output. */
-export const TOKEN_USAGE_REGEX =
-  /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
-
-/** Regex to extract cost from Hermes output. */
-export const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+// NOTE: The session-id / token-usage / cost regexes used to be exported from
+// here, but the actual parsing lives in src/server/execute.ts, which keeps its
+// own (now hardened, line-anchored) copies. The exported versions were dead and
+// had drifted from the real ones, so they were removed to avoid confusion. If
+// these ever need to be shared again, import execute.ts's versions rather than
+// re-declaring them here.
 
 /** Prefix used by Hermes for tool output lines. */
 export const TOOL_OUTPUT_PREFIX = "┊";

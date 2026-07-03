@@ -22,12 +22,14 @@ import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
  * Leaves meaningful emoji (💻 for terminal, 🔍 for search, etc.) intact
  * by only stripping parenthesized kaomoji like (｡◕‿◕｡).
  */
-function stripKaomoji(text: string): string {
-  // Strip parenthesized kaomoji faces: (｡◕‿◕｡), (★ω★), etc.
+export function stripKaomoji(text: string): string {
+  // Strip a LEADING parenthesized kaomoji face: (｡◕‿◕｡), (★ω★), etc.
+  // Anchored to the start of the string (no global flag) so only the leading
+  // decoration is removed. Anchoring avoids corrupting non-ASCII content later
+  // in the line — e.g. "café (résumé)" must keep "(résumé)".
   // Require at least one non-ASCII char inside the parens so ordinary
-  // parenthesized text — e.g. print(foo) in a command detail or a (0.5s)
-  // duration — is left intact.
-  return text.replace(/[(](?=[^()]{2,20}[)])[^()]*[^\x00-\x7F][^()]*[)]\s*/gu, "").trim();
+  // parenthesized text — e.g. print(foo) or a (0.5s) duration — is left intact.
+  return text.replace(/^\s*[(](?=[^()]{2,20}[)])[^()]*[^\x00-\x7F][^()]*[)]\s*/u, "").trim();
 }
 
 // ── Line classification ────────────────────────────────────────────────────
